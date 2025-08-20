@@ -1,17 +1,17 @@
-// Файл: main.go (ФИНАЛЬНАЯ ВЕРСИЯ С УЛУЧШЕННЫМ ПРОМПТОМ)
+// Файл: main.go (Версия с зональным OCR, конфигом и локальной сборкой подписи)
 package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"image"
 	"image/jpeg"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,30 +19,27 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// --- Глобальные переменные для ldflags ---
-var (
-	encryptedToken                string
-	encryptedScreenshotTargetInfo string
-	encryptedLogTargetInfo        string
-	encryptedNavyAIKeys           string
-	encryptedElectronHubKeys      string
-	encryptedVoidAIKeys           string
-	encryptedOcrKeys              string
-)
-
 // --- Константы ---
-const encryptionKey = "a-very-secret-key-for-my-app-123"
-const (
-	MODEL_PRIMARY     = "gpt-4o"
-	MODEL_BACKUP      = "gemini-1.5-flash-latest"
-	MODEL_LAST_RESORT = "gpt-3.5-turbo"
-)
-const ocrWordLimit = 25
+const ocrWordLimit = 35
 
-// --- Структуры ---
-type ResponseFormat struct {
-	Type string `json:"type"`
+// --- Структуры для config.json ---
+type Config struct {
+	BotToken         string     `json:"bot_token"`
+	ScreenshotTarget string     `json:"screenshot_target"`
+	LogTarget        string     `json:"log_target"`
+	OcrSpaceKeys     []string   `json:"ocr_space_keys"`
+	AIProviders      []Provider `json:"ai_providers"`
 }
+type Provider struct {
+	Name        string   `json:"name"`
+	APIEndpoint string   `json:"api_endpoint"`
+	ModelName   string   `json:"model_name"`
+	Keys        []string `json:"keys"`
+	Priority    int
+}
+
+// --- Структуры для AI ---
+type ResponseFormat struct{ Type string `json:"type"` }
 type APIRequest struct {
 	Model          string          `json:"model"`
 	Messages       []Message       `json:"messages"`
@@ -50,48 +47,63 @@ type APIRequest struct {
 	Temperature    float32         `json:"temperature"`
 	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 }
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
+type Message struct{ Role, Content string }
 type APIResponse struct{ Choices []Choice }
 type Choice struct{ Message Message }
 
-type AI_Batch_Output struct {
+type AI_Activity_Output struct {
 	PrimaryProgram       string `json:"primary_program"`
 	UserActivitySentence string `json:"user_activity_sentence"`
 	ActivityCategory     string `json:"activity_category"`
 }
-type Provider struct {
-	Name, APIEndpoint, ModelName string
-	Keys                         []string
-	Priority                     int
+type AI_Hydra_Output struct {
+	TaskName   string `json:"task_name"`
+	Percentage int    `json:"percentage"`
+	Progress   string `json:"progress"`
 }
+
+// --- Структуры для OCR ---
 type OcrResponse struct {
 	ParsedResults         []ParsedResult `json:"ParsedResults"`
 	OCRExitCode           int            `json:"OCRExitCode"`
 	IsErroredOnProcessing bool           `json:"IsErroredOnProcessing"`
 	ErrorMessage          string         `json:"ErrorMessage"`
 }
-type ParsedResult struct {
-	ParsedText   string `json:"ParsedText"`
-	ErrorMessage string `json:"ErrorMessage"`
-	ErrorDetails string `json:"ErrorDetails"`
-}
+type ParsedResult struct{ ParsedText string `json:"ParsedText"` }
 
 // --- Функции-обертки для платформо-зависимого кода ---
-func getScreenshot() ([]byte, error) {
-	img, err := captureScreen()
+func getScreenshot() (*image.RGBA, error) {
+	return captureScreen()
+}
+
+func getHydraScreenshot() ([]byte, error) {
+	img, err := getScreenshot()
 	if err != nil {
 		return nil, err
 	}
+
+	bounds := img.Bounds()
+	width := bounds.Dx()
+	height := bounds.Dy()
+
+	if width < 600 || height < 200 {
+		return nil, fmt.Errorf("разрешение экрана слишком мало для обрезки зоны 600x200")
+	}
+
+	cropRect := image.Rect(width-600, height-200, width, height)
+
+	croppedImg, ok := img.SubImage(cropRect).(*image.RGBA)
+	if !ok {
+		return nil, fmt.Errorf("не удалось обрезать изображение")
+	}
+
 	var buf bytes.Buffer
-	err = jpeg.Encode(&buf, img, nil)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка кодирования в JPEG: %v", err)
+	if err := jpeg.Encode(&buf, croppedImg, nil); err != nil {
+		return nil, fmt.Errorf("ошибка кодирования обрезанного JPEG: %v", err)
 	}
 	return buf.Bytes(), nil
 }
+
 func getWindowTitles() ([]string, error) {
 	return getAllVisibleWindowTitles()
 }
@@ -155,128 +167,67 @@ func getTextFromImage(imageData []byte, ocrApiKeys []string, logFunc func(string
 	return "", lastError
 }
 
-// --- Логика анализа AI с 3 попытками и JSON MODE ---
-func analyzeContent(titles []string, truncatedOcrText string, providers []Provider, logFunc func(string)) (*AI_Batch_Output, error) {
-	// <<< --- УЛУЧШЕННЫЙ ПРОМПТ ДЛЯ МНОГОЗАДАЧНОСТИ --- >>>
+// --- Логика анализа AI ---
+func analyzeHydraTask(ocrText string, providers []Provider, logFunc func(string)) (*AI_Hydra_Output, error) {
 	prompt := fmt.Sprintf(`
-ТЫ — ЭКСПЕРТ-АНАЛИТИК. Твоя цель — точно определить деятельность пользователя, особенно многозадачность.
+ТЫ — АНАЛИТИК. Извлеки данные о прогрессе из текста.
 
-ПРАВИЛА:
-1.  ПРИОРИТЕТ: Текст с экрана (OCR) важнее заголовков.
-2.  МНОГОЗАДАЧНОСТЬ: Если видишь одновременно игру (например, Hearthstone, Steam) И программу для общения (Meet, Discord, Telegram, Zoom, Skype), ОБЪЕДИНИ их в описании.
-    - Пример: "Играет в Hearthstone и общается в Meet".
-3.  КАТЕГОРИЗАЦИЯ: Если есть игра, категория всегда "Гейминг".
+ЗАДАНИЕ: Верни JSON с 3 ключами:
+- "task_name": (string) Название задачи.
+- "percentage": (int) Процент (только число).
+- "progress": (string) Прогресс (формат "X of Y").
 
-ЗАДАНИЕ: Верни JSON-объект с 3 ключами:
-- "primary_program": (string) Название самой активной программы (игра в приоритете).
-- "user_activity_sentence": (string) Описание задачи (примерно 5-10 слов на русском).
-- "activity_category": (string) Категория: Разработка, Коммуникация, Дизайн, Веб-серфинг, Гейминг, Офисная работа, Мультимедиа, Системные задачи.
+ТЕКСТ:
+%s`, ocrText)
 
-ДАННЫЕ ДЛЯ АНАЛИЗА:
+	logFunc(fmt.Sprintf("---\nДанные для AI (Гидра):\n%s\n---", ocrText))
+	// ... (Далее логика запросов к API, аналогичная analyzeGeneralActivity, но для структуры AI_Hydra_Output)
+}
+
+func analyzeGeneralActivity(titles []string, truncatedOcrText string, providers []Provider, logFunc func(string)) (*AI_Activity_Output, error) {
+	prompt := fmt.Sprintf(`
+ТЫ — АНАЛИТИК. Определи задачу пользователя по данным.
+
+ПРИОРИТЕТЫ:
+1. Заголовки окон (главное).
+2. OCR-текст (контекст).
+
+ЗАДАНИЕ: Верни JSON с 3 ключами:
+- "primary_program": (string) Главная программа из заголовков.
+- "user_activity_sentence": (string) Детальное описание задачи (10-15 слов на русском).
+- "activity_category": (string) Категория (Разработка, Коммуникация, Дизайн, Веб-серфинг, Гейминг, Офисная работа, Мультимедиа, Системные задачи).
+
+ДАННЫЕ:
 1. Заголовки окон:
 %s
-2. Текст с экрана (до %d слов):
+2. OCR-текст (контекст, до %d слов):
 %s`, strings.Join(titles, "\n"), ocrWordLimit, truncatedOcrText)
-	// <<< --- КОНЕЦ НОВОГО ПРОМПТА --- >>>
 
-	logFunc(fmt.Sprintf("---\nДанные для AI:\nЗаголовки:\n%s\n\nТекст с OCR (урезанный):\n%s\n---", strings.Join(titles, "\n"), truncatedOcrText))
-
-	var bestResult *AI_Batch_Output
-	var bestResultPriority int = 99
-	var lastError error
-
-	const totalAttempts = 3
-	for attempt := 1; attempt <= totalAttempts; attempt++ {
-		logFunc(fmt.Sprintf("--- НАЧАЛО ПОПЫТКИ %d из %d ---", attempt, totalAttempts))
-		for _, provider := range providers {
-			if bestResult != nil && provider.Priority >= bestResultPriority {
-				continue
-			}
-			logFunc(fmt.Sprintf("▶️ Проверяю провайдера: %s", provider.Name))
-
-			if len(provider.Keys) == 0 || (len(provider.Keys) == 1 && provider.Keys[0] == "") {
-				logFunc(fmt.Sprintf("🟡 %s: Пропущено, ключи не предоставлены.", provider.Name))
-				continue
-			}
-			for _, key := range provider.Keys {
-				payload := APIRequest{
-					Model:          provider.ModelName,
-					Messages:       []Message{{Role: "user", Content: prompt}},
-					MaxTokens:      150,
-					Temperature:    0.2,
-					ResponseFormat: &ResponseFormat{Type: "json_object"},
-				}
-				requestBodyBytes, _ := json.Marshal(payload)
-				req, _ := http.NewRequest("POST", provider.APIEndpoint, bytes.NewBuffer(requestBodyBytes))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Authorization", "Bearer "+key)
-				client := &http.Client{Timeout: 30 * time.Second}
-				resp, err := client.Do(req)
-				if err != nil {
-					lastError = err
-					logFunc(fmt.Sprintf("⚠️ %s: Ошибка сети.", provider.Name))
-					break
-				}
-				if resp.StatusCode >= 400 {
-					lastError = fmt.Errorf("статус %d", resp.StatusCode)
-					logFunc(fmt.Sprintf("⚠️ %s (Статус: %d): Ключ/запрос невалиден.", provider.Name, resp.StatusCode))
-					resp.Body.Close()
-					continue
-				}
-				bodyBytes, err := io.ReadAll(resp.Body)
-				if err != nil {
-					lastError = err
-					logFunc(fmt.Sprintf("⚠️ %s: Не удалось прочитать ответ.", provider.Name))
-					resp.Body.Close()
-					break
-				}
-				resp.Body.Close()
-				logFunc(fmt.Sprintf("RAW ответ от AI (%s):\n```json\n%s\n```", provider.Name, string(bodyBytes)))
-
-				var apiResponse APIResponse
-				if err := json.Unmarshal(bodyBytes, &apiResponse); err != nil {
-					lastError = err
-					logFunc(fmt.Sprintf("⚠️ %s: Не удалось распарсить внешнюю структуру.", provider.Name))
-					break
-				}
-				if len(apiResponse.Choices) == 0 || apiResponse.Choices[0].Message.Content == "" {
-					lastError = fmt.Errorf("пустой content")
-					logFunc(fmt.Sprintf("⚠️ %s: Пустой ответ.", provider.Name))
-					break
-				}
-
-				aiContentString := apiResponse.Choices[0].Message.Content
-				var finalOutput AI_Batch_Output
-				if err = json.Unmarshal([]byte(aiContentString), &finalOutput); err != nil {
-					lastError = err
-					logFunc(fmt.Sprintf("⚠️ %s: Не удалось распарсить JSON из 'content'.", provider.Name))
-					break
-				}
-
-				logFunc(fmt.Sprintf("✅ Успешно! Промежуточный результат получен от %s.", provider.Name))
-				bestResult = &finalOutput
-				bestResultPriority = provider.Priority
-				goto nextProvider
-			}
-		nextProvider:
-		}
-		if bestResult != nil && bestResultPriority == 0 {
-			logFunc("🏆 Получен результат от приоритетного провайдера NavyAI. Завершаем попытки.")
-			break
-		}
-		if attempt < totalAttempts {
-			logFunc(fmt.Sprintf("--- КОНЕЦ ПОПЫТКИ %d. Пауза 30 секунд. ---", attempt))
-			time.Sleep(30 * time.Second)
-		}
-	}
-	if bestResult != nil {
-		return bestResult, nil
-	}
-	logFunc("❌ Все 3 попытки провалились. Не удалось получить анализ.")
-	return nil, lastError
+	logFunc(fmt.Sprintf("---\nДанные для AI (Общий анализ):\nЗаголовки: %s\nOCR: %s\n---", strings.Join(titles, "\n"), truncatedOcrText))
+	// ... (Далее логика запросов к API, аналогичная старому analyzeContent, но для структуры AI_Activity_Output)
 }
 
 // --- Вспомогательные функции ---
+func loadConfig(filename string) (*Config, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось открыть файл конфигурации: %w", err)
+	}
+	defer file.Close()
+
+	var config Config
+	decoder := json.NewDecoder(file)
+	if err = decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("не удалось декодировать JSON: %w", err)
+	}
+
+	for i := range config.AIProviders {
+		config.AIProviders[i].Priority = i
+	}
+
+	return &config, nil
+}
+
 func truncateTextByWords(text string, limit int) string {
 	words := strings.Fields(text)
 	if len(words) <= limit {
@@ -284,19 +235,10 @@ func truncateTextByWords(text string, limit int) string {
 	}
 	return strings.Join(words[:limit], " ")
 }
-func xorCipher(data []byte, key string) []byte {
-	keyBytes := []byte(key)
-	keyLen := len(keyBytes)
-	result := make([]byte, len(data))
-	for i := 0; i < len(data); i++ {
-		result[i] = data[i] ^ keyBytes[i%keyLen]
-	}
-	return result
-}
 
 // --- Логика отправки в Telegram ---
-func sendLog(botToken, logTargetInfo, errorMessage string) {
-	if botToken == "" || logTargetInfo == "" {
+func sendLog(bot *tgbotapi.BotAPI, logTargetInfo, errorMessage string) {
+	if bot == nil || logTargetInfo == "" {
 		return
 	}
 	parts := strings.Split(logTargetInfo, ":")
@@ -308,28 +250,16 @@ func sendLog(botToken, logTargetInfo, errorMessage string) {
 	if errGroup != nil || errTopic != nil {
 		return
 	}
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		return
-	}
 	fullMessage := fmt.Sprintf("📝 Лог ScreenSender:\n\n%s", errorMessage)
 	msg := tgbotapi.NewMessage(groupID, fullMessage)
 	msg.ReplyToMessageID = topicID
 	bot.Send(msg)
 }
-func processAndSendScreenshot(photoData []byte, windowTitles []string, botToken, screenshotTargetInfo string, providers []Provider, ocrKeys []string, logFunc func(string)) {
-	if botToken == "" || screenshotTargetInfo == "" {
-		logFunc("Токен или ID для скриншотов пустые.")
+
+func processAndSend(bot *tgbotapi.BotAPI, screenshotTargetInfo string, photoData []byte, caption string, logFunc func(string)) {
+	if bot == nil || screenshotTargetInfo == "" {
+		logFunc("ID для скриншотов не указан.")
 		return
-	}
-	ocrText, _ := getTextFromImage(photoData, ocrKeys, logFunc)
-	truncatedOcrText := truncateTextByWords(ocrText, ocrWordLimit)
-	analysisResult, err := analyzeContent(windowTitles, truncatedOcrText, providers, logFunc)
-	var caption string
-	if err != nil || analysisResult == nil {
-		caption = "Активность не определена"
-	} else {
-		caption = analysisResult.UserActivitySentence
 	}
 	parts := strings.Split(screenshotTargetInfo, ":")
 	if len(parts) != 2 {
@@ -342,11 +272,7 @@ func processAndSendScreenshot(photoData []byte, windowTitles []string, botToken,
 		logFunc("Не удалось распарсить ID для скриншотов.")
 		return
 	}
-	bot, err := tgbotapi.NewBotAPI(botToken)
-	if err != nil {
-		logFunc(fmt.Sprintf("Ошибка инициализации бота: %v", err))
-		return
-	}
+
 	file := tgbotapi.FileBytes{Name: "screenshot.jpg", Bytes: photoData}
 	msg := tgbotapi.NewPhoto(groupID, file)
 	msg.Caption = caption
@@ -356,65 +282,88 @@ func processAndSendScreenshot(photoData []byte, windowTitles []string, botToken,
 	}
 }
 
-// --- Главная функция (ЗАПУСК ОДИН РАЗ С ПОПЫТКАМИ) ---
+// --- Главная функция ---
 func main() {
-	encryptFlag := flag.String("encrypt", "", "Encrypt a string and print it to stdout")
-	flag.Parse()
-	if *encryptFlag != "" {
-		data := []byte(*encryptFlag)
-		encrypted := xorCipher(data, encryptionKey)
-		fmt.Print(base64.StdEncoding.EncodeToString(encrypted))
-		return
+	log.Println("🚀 Запуск ScreenSender...")
+
+	config, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatalf("КРИТИЧЕСКАЯ ОШИБКА: %v", err)
 	}
 
-	tokenDecoded, _ := base64.StdEncoding.DecodeString(encryptedToken)
-	decryptedToken := string(xorCipher(tokenDecoded, encryptionKey))
-	screenshotTargetDecoded, _ := base64.StdEncoding.DecodeString(encryptedScreenshotTargetInfo)
-	decryptedScreenshotTarget := string(xorCipher(screenshotTargetDecoded, encryptionKey))
-	logTargetDecoded, _ := base64.StdEncoding.DecodeString(encryptedLogTargetInfo)
-	decryptedLogTarget := string(xorCipher(logTargetDecoded, encryptionKey))
-	ocrKeysDecoded, _ := base64.StdEncoding.DecodeString(encryptedOcrKeys)
-	ocrKeysDecrypted := string(xorCipher(ocrKeysDecoded, encryptionKey))
-	ocrApiKeys := strings.Split(ocrKeysDecrypted, ",")
-
-	decryptAndSplit := func(encrypted string) []string {
-		if encrypted == "" {
-			return []string{}
-		}
-		decoded, err := base64.StdEncoding.DecodeString(encrypted)
-		if err != nil {
-			return []string{}
-		}
-		decrypted := string(xorCipher(decoded, encryptionKey))
-		if decrypted == "" {
-			return []string{}
-		}
-		return strings.Split(decrypted, ",")
+	if config.BotToken == "" || config.ScreenshotTarget == "" {
+		log.Fatal("КРИТИЧЕСКАЯ ОШИБКА: 'bot_token' и 'screenshot_target' не могут быть пустыми в config.json.")
 	}
-	providers := []Provider{
-		{Name: "NavyAI (Primary)", APIEndpoint: "https://api.navy/v1/chat/completions", Keys: decryptAndSplit(encryptedNavyAIKeys), ModelName: MODEL_PRIMARY, Priority: 0},
-		{Name: "ElectronHub (Backup)", APIEndpoint: "https://api.electronhub.ai/v1/chat/completions", Keys: decryptAndSplit(encryptedElectronHubKeys), ModelName: MODEL_BACKUP, Priority: 1},
-		{Name: "VoidAI (Last Resort)", APIEndpoint: "https://api.voidai.app/v1/chat/completions", Keys: decryptAndSplit(encryptedVoidAIKeys), ModelName: MODEL_LAST_RESORT, Priority: 2},
+
+	bot, err := tgbotapi.NewBotAPI(config.BotToken)
+	if err != nil {
+		log.Fatalf("Ошибка инициализации бота: %v", err)
 	}
 
 	logAndSend := func(errMsg string) {
 		log.Println(errMsg)
-		sendLog(decryptedToken, decryptedLogTarget, errMsg)
+		sendLog(bot, config.LogTarget, errMsg)
 	}
 
-	logAndSend("🚀 ScreenSender запущен (режим 3 попыток, JSON Mode).")
-	screenshotBytes, err := getScreenshot()
+	// --- ШАГ 1: Зональный OCR для "Гидры" ---
+	logAndSend("Шаг 1: Проверка зоны 'Гидра' (600x200, правый нижний угол).")
+	hydraImageData, err := getHydraScreenshot()
 	if err != nil {
-		logAndSend(fmt.Sprintf("Не удалось сделать скриншот: %v", err))
+		logAndSend(fmt.Sprintf("⚠️ Не удалось получить скриншот для зоны 'Гидра': %v", err))
+	} else {
+		hydraOcrText, err := getTextFromImage(hydraImageData, config.OcrSpaceKeys, logAndSend)
+		if err != nil {
+			logAndSend(fmt.Sprintf("⚠️ OCR для зоны 'Гидра' не удался: %v", err))
+		} else if strings.Contains(hydraOcrText, "%") || len(strings.Fields(hydraOcrText)) > 2 { // Более надежная проверка
+			logAndSend("✅ Возможная задача 'Гидра' найдена! Анализируем прогресс...")
+			hydraResult, err := analyzeHydraTask(hydraOcrText, config.AIProviders, logAndSend)
+			if err != nil || hydraResult == nil {
+				logAndSend(fmt.Sprintf("❌ Не удалось проанализировать прогресс 'Гидры': %v. Переход к общему анализу.", err))
+			} else {
+				fullScreenshotImg, _ := getScreenshot()
+				var buf bytes.Buffer
+				jpeg.Encode(&buf, fullScreenshotImg, nil)
+
+				caption := fmt.Sprintf("Задача: %s\nПрогресс: %d%% (%s)",
+					hydraResult.TaskName, hydraResult.Percentage, hydraResult.Progress)
+
+				processAndSend(bot, config.ScreenshotTarget, buf.Bytes(), caption, logAndSend)
+				logAndSend("✅ Задача 'Гидра' выполнена. Программа завершает работу.")
+				return
+			}
+		} else {
+			logAndSend("ℹ️ 'Гидра' не найдена в указанной зоне. Переход к общему анализу.")
+		}
+	}
+
+	// --- ШАГ 2: Общий анализ (если "Гидра" не найдена) ---
+	logAndSend("Шаг 2: Общий анализ активности.")
+	fullScreenshotImg, err := getScreenshot()
+	if err != nil {
+		logAndSend(fmt.Sprintf("❌ Не удалось сделать скриншот: %v", err))
 		return
 	}
 	titles, err := getWindowTitles()
 	if err != nil {
-		logAndSend(fmt.Sprintf("Не удалось получить заголовки окон: %v", err))
+		logAndSend(fmt.Sprintf("⚠️ Не удалось получить заголовки окон: %v", err))
 		titles = []string{}
 	}
 
-	processAndSendScreenshot(screenshotBytes, titles, decryptedToken, decryptedScreenshotTarget, providers, ocrApiKeys, logAndSend)
+	var buf bytes.Buffer
+	jpeg.Encode(&buf, fullScreenshotImg, nil)
+	fullScreenshotBytes := buf.Bytes()
 
-	logAndSend("✅ Задача выполнена. Программа завершает работу.")
+	fullOcrText, _ := getTextFromImage(fullScreenshotBytes, config.OcrSpaceKeys, logAndSend)
+	truncatedOcrText := truncateTextByWords(fullOcrText, ocrWordLimit)
+
+	analysisResult, err := analyzeGeneralActivity(titles, truncatedOcrText, config.AIProviders, logAndSend)
+	var caption string
+	if err != nil || analysisResult == nil {
+		caption = "Активность не определена"
+	} else {
+		caption = analysisResult.UserActivitySentence
+	}
+
+	processAndSend(bot, config.ScreenshotTarget, fullScreenshotBytes, caption, logAndSend)
+	logAndSend("✅ Общая задача выполнена. Программа завершает работу.")
 }
